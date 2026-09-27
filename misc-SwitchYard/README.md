@@ -1,6 +1,6 @@
 # 🏗️ SwitchYard — BCS CTF 2026
 
-> **Category:** Cryptography
+> **Category:** misc
 > **Difficulty:** —
 > **Flag:** `bcsctf{h1gh_b1t5_0f_n0nc35_5h4773r_pr1v473_k3y5}`
 
