@@ -1,290 +1,158 @@
 #!/usr/bin/env python3
+"""
+solve.py -- Recover the hidden message from frame_014.png + recorder.sqlite
 
-import hashlib
-import sqlite3
+Usage:
+    python3 solve.py [path/to/frame_014.png] [path/to/recorder.sqlite]
+
+Defaults to ./frame_014.png and ./recorder.sqlite if no args are given.
+
+Pipeline (reverse of the recorder's embed process):
+  1. Look up the case matching the target frame in the `runs` table.
+  2. Pull the crash-ring JSON footer appended after IEND in the PNG
+     (marker: 00 ff 52 49 4e 47 00 + uint32 BE zlib length + zlib JSON).
+  3. Derive session_key = SHA256(share_a XOR share_b || case_id).
+  4. Undo the XOR mask: XOR pixel bytes with a keystream built from
+     SHA256(session_key || ":" || frame_filename || ":" || counter_BE).
+  5. Undo the row shift: roll each row left by (7*y + 11) mod width.
+  6. Walk pixel indices idx = (base + n*stride) mod (W*H), read the RED
+     channel's LSB, pack bits MSB-first to rebuild the packet.
+  7. Parse packet: "BCS1" magic + uint16 BE length + payload + uint32 BE CRC32.
+"""
+
+import sys
 import struct
+import sqlite3
 import zlib
+import hashlib
 
+import numpy as np
 from PIL import Image
 
-
-PNG_FILE = "frame_014.png"
-DB_FILE = "recorder.sqlite"
-
-CASE_ID = "IC-CGU67042.2025.11337981"
-
-RING_MARKER = b"\x00\xffRING\x00"
+RING_MARKER = bytes.fromhex("00ff52494e4700")
 
 
-def recover_footer(filename):
-    """Recover the crash-ring JSON appended after the PNG IEND chunk."""
-    with open(filename, "rb") as f:
-        data = f.read()
-
-    pos = data.find(RING_MARKER)
-
-    if pos == -1:
-        raise RuntimeError("Crash-ring marker not found")
-
-    offset = pos + len(RING_MARKER)
-
-    compressed_len = struct.unpack(
-        ">I",
-        data[offset:offset + 4]
-    )[0]
-
-    offset += 4
-
-    compressed = data[offset:offset + compressed_len]
-
-    footer = zlib.decompress(compressed)
-
-    import json
-    return json.loads(footer)
-
-
-def get_share_a():
-    """Get share A from recorder.sqlite."""
-    conn = sqlite3.connect(DB_FILE)
-
-    row = conn.execute(
-        """
-        SELECT share_a_hex
-        FROM runs
-        WHERE case_id = ?
-          AND frame_file = ?
-        """,
-        (CASE_ID, PNG_FILE)
-    ).fetchone()
-
-    conn.close()
-
+def find_case(db_path, frame_filename):
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT case_id, share_a_hex, state FROM runs WHERE frame_file=?",
+        (frame_filename,),
+    )
+    row = cur.fetchone()
     if row is None:
-        raise RuntimeError("Case not found in database")
-
-    return bytes.fromhex(row[0])
-
-
-def derive_session_key(share_a, share_b):
-    """Derive session key from XOR of both shares and case ID."""
-    xor_bytes = bytes(
-        a ^ b
-        for a, b in zip(share_a, share_b)
-    )
-
-    return hashlib.sha256(
-        xor_bytes + CASE_ID.encode()
-    ).digest()
+        raise ValueError(f"No run found for frame {frame_filename!r}")
+    case_id, share_a_hex, state = row
+    conn.close()
+    return case_id, share_a_hex, state
 
 
-def generate_keystream(session_key, filename, length):
-    """Generate SHA256 counter-mode keystream."""
-    stream = bytearray()
+def extract_crash_ring(png_path):
+    data = open(png_path, "rb").read()
+    idx = data.find(RING_MARKER)
+    if idx == -1:
+        raise ValueError("No crash-ring footer found after IEND")
+    off = idx + len(RING_MARKER)
+    length = struct.unpack(">I", data[off:off + 4])[0]
+    comp = data[off + 4:off + 4 + length]
+    raw = zlib.decompress(comp)
+    import json
+    return json.loads(raw.decode("utf-8"))
 
+
+def derive_session_key(share_a_hex, share_b_hex, case_id):
+    a = bytes.fromhex(share_a_hex)
+    b = bytes.fromhex(share_b_hex)
+    xor_bytes = bytes(x ^ y for x, y in zip(a, b))
+    return hashlib.sha256(xor_bytes + case_id.encode("ascii")).digest()
+
+
+def build_keystream(session_key, frame_filename, nbytes):
+    blocks = []
     counter = 0
-
-    while len(stream) < length:
-        block = hashlib.sha256(
-            session_key
-            + b":"
-            + filename.encode()
-            + b":"
-            + struct.pack(">I", counter)
-        ).digest()
-
-        stream.extend(block)
+    total = 0
+    while total < nbytes:
+        msg = session_key + b":" + frame_filename.encode("ascii") + b":" + struct.pack(">I", counter)
+        d = hashlib.sha256(msg).digest()
+        blocks.append(d)
+        total += len(d)
         counter += 1
-
-    return bytes(stream[:length])
-
-
-def unmask(image, session_key):
-    """Undo the XOR mask."""
-    width, height = image.size
-
-    rgb = bytearray(image.convert("RGB").tobytes())
-
-    keystream = generate_keystream(
-        session_key,
-        PNG_FILE,
-        len(rgb)
-    )
-
-    for i in range(len(rgb)):
-        rgb[i] ^= keystream[i]
-
-    return width, height, rgb
+    return b"".join(blocks)[:nbytes]
 
 
-def unshift_rows(width, height, rgb):
-    """Undo the per-row circular right shift."""
-    result = bytearray(len(rgb))
-
-    row_bytes = width * 3
-
-    for y in range(height):
-        shift_pixels = (7 * y + 11) % width
-        shift_bytes = shift_pixels * 3
-
-        start = y * row_bytes
-        row = rgb[start:start + row_bytes]
-
-        # Inverse of right rotation = left rotation
-        restored = row[shift_bytes:] + row[:shift_bytes]
-
-        result[start:start + row_bytes] = restored
-
-    return result
+def unmask(arr, session_key, frame_filename):
+    H, W, _ = arr.shape
+    flat = arr.reshape(-1).astype(np.uint8)
+    ks = np.frombuffer(build_keystream(session_key, frame_filename, flat.size), dtype=np.uint8)
+    return np.bitwise_xor(flat, ks).reshape(H, W, 3)
 
 
-def extract_packet(width, height, rgb):
-    """Extract RED-channel LSBs using the embedded walk."""
-    total_pixels = width * height
-
-    base = 137
-    stride = 4099
-
-    bits = []
-
-    # Need enough bits for the maximum packet.
-    # A 256x256 image contains 65536 pixels,
-    # so there are 65536 available RED-channel LSBs.
-    for n in range(total_pixels):
-        idx = (base + n * stride) % total_pixels
-
-        red_offset = idx * 3
-
-        bit = rgb[red_offset] & 1
-
-        bits.append(bit)
-
-    # Pack MSB-first
-    output = bytearray()
-
-    for i in range(0, len(bits), 8):
-        byte = 0
-
-        chunk = bits[i:i + 8]
-
-        if len(chunk) < 8:
-            break
-
-        for bit in chunk:
-            byte = (byte << 1) | bit
-
-        output.append(byte)
-
-    return bytes(output)
+def unshift_rows(arr):
+    H, W, _ = arr.shape
+    out = np.zeros_like(arr)
+    for y in range(H):
+        shift = (7 * y + 11) % W
+        out[y] = np.roll(arr[y], -shift, axis=0)  # invert the recorder's rightward roll
+    return out
 
 
-def parse_packet(data):
-    """Parse BCS1 packet and verify CRC32."""
-    if data[:4] != b"BCS1":
-        raise RuntimeError(
-            f"Invalid magic: {data[:4]!r}"
-        )
+def extract_packet(arr, base, stride):
+    H, W, _ = arr.shape
+    N = W * H
 
-    payload_length = struct.unpack(
-        ">H",
-        data[4:6]
-    )[0]
+    def get_bit(n):
+        idx = (base + n * stride) % N
+        x, y = idx % W, idx // W
+        return int(arr[y, x, 0]) & 1
 
-    packet_length = 4 + 2 + payload_length + 4
+    def bits_to_bytes(bits):
+        out = bytearray()
+        for i in range(0, len(bits), 8):
+            byte = 0
+            for j in range(8):
+                byte = (byte << 1) | bits[i + j]
+            out.append(byte)
+        return bytes(out)
 
-    if len(data) < packet_length:
-        raise RuntimeError("Incomplete packet")
+    header_bits = [get_bit(n) for n in range(48)]  # 4 (magic) + 2 (length) bytes
+    header = bits_to_bytes(header_bits)
+    magic, length = header[0:4], struct.unpack(">H", header[4:6])[0]
+    if magic != b"BCS1":
+        raise ValueError(f"Bad magic: {magic!r}")
 
-    payload_start = 6
-    payload_end = payload_start + payload_length
+    total_bits = (4 + 2 + length + 4) * 8
+    bits = [get_bit(n) for n in range(total_bits)]
+    packet = bits_to_bytes(bits)
 
-    payload = data[payload_start:payload_end]
+    payload = packet[6:6 + length]
+    crc_stored = struct.unpack(">I", packet[6 + length:6 + length + 4])[0]
+    crc_calc = zlib.crc32(payload) & 0xFFFFFFFF
+    if crc_stored != crc_calc:
+        raise ValueError(f"CRC mismatch: stored {crc_stored:#x} != calc {crc_calc:#x}")
 
-    stored_crc = struct.unpack(
-        ">I",
-        data[payload_end:payload_end + 4]
-    )[0]
-
-    calculated_crc = zlib.crc32(payload) & 0xffffffff
-
-    print(f"[+] Magic       : {data[:4].decode()}")
-    print(f"[+] Length      : {payload_length}")
-    print(f"[+] Stored CRC  : 0x{stored_crc:08x}")
-    print(f"[+] Calculated  : 0x{calculated_crc:08x}")
-
-    if stored_crc != calculated_crc:
-        raise RuntimeError("CRC32 verification failed")
-
-    return payload.decode("ascii")
+    return payload
 
 
 def main():
-    print("[*] Recovering crash-ring footer...")
+    png_path = sys.argv[1] if len(sys.argv) > 1 else "frame_014.png"
+    db_path = sys.argv[2] if len(sys.argv) > 2 else "recorder.sqlite"
+    frame_filename = png_path.split("/")[-1]
 
-    footer = recover_footer(PNG_FILE)
+    case_id, share_a_hex, state = find_case(db_path, frame_filename)
+    print(f"[+] Case: {case_id} (state: {state})")
 
-    print(f"[+] Case        : {footer['case']}")
-    print(f"[+] Bit order   : {footer['bit_order']}")
-    print(f"[+] Base        : {footer['bit_walk_base']}")
-    print(f"[+] Stride      : {footer['bit_walk_stride']}")
+    footer = extract_crash_ring(png_path)
+    print(f"[+] Crash-ring footer: {footer}")
 
-    share_b = bytes.fromhex(
-        footer["share_b_hex"]
-    )
+    session_key = derive_session_key(share_a_hex, footer["share_b_hex"], case_id)
+    print(f"[+] Session key: {session_key.hex()}")
 
-    print("[*] Reading share A from database...")
+    arr = np.array(Image.open(png_path).convert("RGB"))
+    arr = unmask(arr, session_key, frame_filename)
+    arr = unshift_rows(arr)
 
-    share_a = get_share_a()
-
-    print("[*] Deriving session key...")
-
-    session_key = derive_session_key(
-        share_a,
-        share_b
-    )
-
-    print(
-        f"[+] Session key : {session_key.hex()}"
-    )
-
-    print("[*] Loading image...")
-
-    image = Image.open(PNG_FILE).convert("RGB")
-
-    print(
-        f"[+] Image size  : {image.width}x{image.height}"
-    )
-
-    print("[*] Removing XOR mask...")
-
-    width, height, unmasked = unmask(
-        image,
-        session_key
-    )
-
-    print("[*] Undoing row shifts...")
-
-    restored = unshift_rows(
-        width,
-        height,
-        unmasked
-    )
-
-    print("[*] Extracting embedded bits...")
-
-    packet_data = extract_packet(
-        width,
-        height,
-        restored
-    )
-
-    print("[*] Parsing packet...")
-
-    flag = parse_packet(packet_data)
-
-    print()
-    print("=" * 60)
-    print(f"FLAG: {flag}")
-    print("=" * 60)
+    payload = extract_packet(arr, footer["bit_walk_base"], footer["bit_walk_stride"])
+    print(f"[+] Recovered payload: {payload.decode('ascii')}")
 
 
 if __name__ == "__main__":
